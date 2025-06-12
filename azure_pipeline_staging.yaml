@@ -1,0 +1,141 @@
+trigger:
+- staging
+
+pool:
+  name: Azure Pipelines
+
+resources:
+- repo: self
+
+variables:
+  - group: galileofastapi  # reference to the variable group named 'galileofastapi'
+  - name: buildId
+    value: '$(Build.BuildId)'
+  # Convert repository name to lowercase for Docker compatibility
+  - name: repoName
+    value: '$(Build.Repository.Name)'
+  - name: lowerRepoName
+    value: '$[lower(variables.repoName)]'
+  - name: imageName
+    value: 'galimageapi-galileofastapi'
+  - name: containerRegistry
+    value: 'galileoacr2.azurecr.io'
+  - name: containerAppName
+    value: 'galileo-api-staging'
+  - name: resourceGroup
+    value: 'Galileo'
+
+stages:
+- stage: Build
+  displayName: 'Build and Test'
+  jobs:
+  - job: BuildAndTest
+    displayName: 'Build and Test'
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    # Build the test image
+    - task: Docker@2
+      displayName: 'Build Test Image'
+      inputs:
+        command: build
+        dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+        repository: $(imageName)
+        tags: |
+          $(Build.BuildId)-test
+        arguments: '--target test'
+    
+    # Run tests with Azure CLI and Managed Identity
+    - task: AzureCLI@2
+      displayName: 'Run Tests with pytest and Service Principal'
+      inputs:
+        azureSubscription: 'ITServices-Galileo'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |         
+          IMAGE_NAME="$(imageName):$(Build.BuildId)-test"
+          
+          
+          echo "FxR: $IMAGE_NAME"
+          
+      
+          
+          # # Run the test container with service principal details
+          echo "Running tests with service principal credentials..."
+          docker run --rm \
+            -e AZURE_CLIENT_ID="$(AZURE_CLIENT_ID)" \
+            -e AZURE_TENANT_ID="$(AZURE_TENANT_ID)" \
+            -e AZURE_CLIENT_SECRET="$(AZURE_CLIENT_SECRET)" \
+            -e AZURE_KEYVAULT_URL="https://galileokey.vault.azure.net/" \
+            $IMAGE_NAME pytest
+
+
+- stage: Publish
+  displayName: 'Publish to Registry'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: PublishImage
+    displayName: 'Publish Docker Image'
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    # Authenticate with Azure Container Registry
+    - task: Docker@2
+      displayName: 'Login to ACR'
+      inputs:
+        command: login
+        containerRegistry: 'galileoacr2'
+    
+    # Build Production Image
+    - task: Docker@1
+      displayName: 'Build an image'
+      inputs:
+        azureSubscriptionEndpoint: 'ITServices-Galileo'
+        azureContainerRegistry: galileoacr2.azurecr.io
+        dockerFile: Dockerfile
+        imageName: '$(imageName):staging'
+        
+    # Push the image to Azure Container Registry
+    - task: Docker@0
+      displayName: 'Push an image'
+      inputs:
+        azureSubscription: 'ITServices-Galileo'
+        azureContainerRegistry: '{"loginServer":"galileoacr2.azurecr.io", "id" : "/subscriptions/aa0c0586-aea6-46ce-ba83-bdd6bfd0acfd/resourceGroups/Galileo/providers/Microsoft.ContainerRegistry/registries/galileoacr2"}'
+        action: 'Push an image'
+        imageName: '$(imageName):staging'
+      
+
+- stage: Deploy
+  displayName: 'Deploy to Container App'
+  dependsOn: Publish
+  condition: succeeded()
+  jobs:
+  - job: DeployToContainerApp
+    displayName: 'Deploy to Azure Container App'
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Azure CLI: Create Container App Revision'
+      inputs:
+        azureSubscription: 'ITServices-Galileo'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Install Azure Container App extension if not already installed
+          az extension add --name containerapp --upgrade
+          
+          # Debug information
+          echo "Using image: '$(imageName):staging'"
+          
+          # Create a new revision with the newly built image
+          az containerapp update \
+            --name $(containerAppName) \
+            --resource-group $(resourceGroup) \
+            --image "$(containerRegistry)/$(imageName):staging" \
+            --output table \
+            --set-env-vars \
+             AZURE_CLIENT_ID=$(AZURE_CLIENT_ID) \
+             AZURE_TENANT_ID=$(AZURE_TENANT_ID) \
+             AZURE_CLIENT_SECRET=$(AZURE_CLIENT_SECRET)

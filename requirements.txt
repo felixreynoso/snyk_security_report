@@ -1,0 +1,15 @@
+fastapi
+fastapi-utils
+uvicorn
+python-multipart
+azure-storage-blob
+azure-servicebus
+pymongo
+azure-identity
+httpx
+typing-inspect
+azure-keyvault-secrets 
+fastapi_azure_auth
+pydantic_settings
+python-dotenv
+apscheduler

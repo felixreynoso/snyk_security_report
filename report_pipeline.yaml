@@ -1,0 +1,137 @@
+trigger:
+  branches:
+    include:
+      - report
+  paths:
+    exclude:
+      - README.md
+      - docs/*
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  pythonVersion: '3.11'
+
+stages:
+- stage: SecurityScan
+  displayName: 'Security Analysis'
+  jobs:
+  - job: SecurityAnalysis
+    displayName: 'Run Security Scans'
+    steps:
+    
+    # Checkout code
+    - checkout: self
+      fetchDepth: 0  # Full history for better analysis
+    
+    # Set up Python
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+    
+    # Install dependencies (helps with more accurate scanning)
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install Python dependencies'
+      continueOnError: true  # Don't fail if requirements issues
+    
+    # Microsoft Security DevOps - Main security scanning task
+    - task: MicrosoftSecurityDevOps@1
+      displayName: 'Run Microsoft Security DevOps'
+      inputs:
+        # Enable specific tools for Python/NoSQL
+        categories: 'code,artifacts,IaC,containers'
+        languages: 'python,javascript'
+        tools: 'bandit,eslint,semgrep,trivy'
+      continueOnError: true  # Continue even if vulnerabilities found
+    
+    # Additional Bandit scan specifically for Python security
+    - script: |
+        pip install bandit[toml]
+        bandit -r . -f json -o bandit-report.json || true
+        bandit -r . -f txt
+      displayName: 'Run Bandit Python Security Scanner'
+      continueOnError: true
+    
+    # Safety check for known vulnerable Python packages
+    - script: |
+        pip install safety
+        safety check --json --output safety-report.json || true
+        safety check
+      displayName: 'Check for vulnerable Python packages'
+      continueOnError: true
+    
+    # Semgrep for additional code analysis (great for injection vulnerabilities)
+    - script: |
+        pip install semgrep
+        semgrep --config=auto --json --output=semgrep-report.json . || true
+        semgrep --config=auto .
+      displayName: 'Run Semgrep Security Analysis'
+      continueOnError: true
+    
+    # Secret scanning with additional patterns
+    - script: |
+        pip install detect-secrets
+        detect-secrets scan --all-files --baseline .secrets.baseline || true
+        echo "Checking for common secrets patterns..."
+        grep -r -i "password\|secret\|key\|token" --include="*.py" . || true
+      displayName: 'Additional Secret Detection'
+      continueOnError: true
+    
+    # Publish security scan results
+    - task: PublishTestResults@2
+      displayName: 'Publish Security Test Results'
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/*security*.xml'
+        mergeTestResults: true
+        testRunTitle: 'Security Scan Results'
+      condition: always()
+    
+    # Publish artifacts
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Security Reports'
+      inputs:
+        pathToPublish: '$(System.DefaultWorkingDirectory)'
+        artifactName: 'SecurityReports'
+        artifactType: 'Container'
+        parallel: true
+      condition: always()
+
+# Optional: Separate stage for build/test
+- stage: Build
+  displayName: 'Build and Test'
+  dependsOn: SecurityScan
+  condition: succeeded('SecurityScan')
+  jobs:
+  - job: BuildTest
+    displayName: 'Build and Test Application'
+    steps:
+    
+    - checkout: self
+    
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio httpx
+      displayName: 'Install dependencies'
+    
+    - script: |
+        python -m pytest tests/ -v --junitxml=test-results.xml
+      displayName: 'Run tests'
+      continueOnError: true
+    
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results'
+      inputs:
+        testResultsFiles: 'test-results.xml'
+        testRunTitle: 'Python Tests'
+      condition: always()

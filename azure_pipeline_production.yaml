@@ -1,0 +1,142 @@
+trigger:
+- main
+
+pool:
+  name: Azure Pipelines
+
+variables:
+  - group: galileofastapi
+  - name: imageName
+    value: 'galimageapi-galileofastapi'
+  - name: containerRegistry
+    value: 'galileoacr2.azurecr.io'
+  - name: containerAppName
+    value: 'galileo-api'
+  - name: resourceGroup
+    value: 'Galileo'
+  - name: stagingContainerAppName
+    value: 'galileo-api-staging'
+
+stages:
+- stage: Promote
+  displayName: 'Promote Staging Image to Production buildId: $(Build.BuildId)'
+  jobs:
+  - job: PromoteImage
+    displayName: 'Promote Docker Image'
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    # Authenticate with Azure Container Registry using Docker@1 to match your staging pipeline
+    - task: Docker@1
+      displayName: 'Login to ACR'
+      inputs:
+        azureSubscriptionEndpoint: 'ITServices-Galileo'
+        azureContainerRegistry: '{"loginServer":"galileoacr2.azurecr.io", "id" : "/subscriptions/aa0c0586-aea6-46ce-ba83-bdd6bfd0acfd/resourceGroups/Galileo/providers/Microsoft.ContainerRegistry/registries/galileoacr2"}'
+        command: 'login'
+    
+    # Use Docker commands with Azure CLI to pull, tag, and push images
+    - task: AzureCLI@2
+      displayName: 'Execute Docker Operations'
+      inputs:
+        azureSubscription: 'ITServices-Galileo'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Pull the latest staging image
+          docker pull $(containerRegistry)/$(imageName):staging
+          
+          # Tag the image with 'production'
+          docker tag $(containerRegistry)/$(imageName):staging $(containerRegistry)/$(imageName):production
+          
+          # Push the production tag
+          docker push $(containerRegistry)/$(imageName):production
+          
+          # Tag the image with 'BuildId'
+          docker tag $(containerRegistry)/$(imageName):staging $(containerRegistry)/$(imageName):$(Build.BuildId)
+          
+          # Push the BuildId tag
+          docker push $(containerRegistry)/$(imageName):$(Build.BuildId)
+          
+          # Tag the image with 'latest'
+          docker tag $(containerRegistry)/$(imageName):staging $(containerRegistry)/$(imageName):latest
+          
+          # Push the latest tag
+          docker push $(containerRegistry)/$(imageName):latest
+          
+          # Remove the staging tag
+          az acr repository untag --name galileoacr2 --image $(imageName):staging
+
+- stage: Deploy
+  displayName: 'Deploy to Container App'
+  dependsOn: Promote
+  condition: succeeded()
+  jobs:
+  - job: DeployToContainerApp
+    displayName: 'Deploy to Azure Container App'
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Azure CLI: Create Container App Revision'
+      inputs:
+        azureSubscription: 'ITServices-Galileo'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Install Azure Container App extension if not already installed
+          az extension add --name containerapp --upgrade
+          
+          # Debug information
+          echo "Using image: '$(containerRegistry)/$(imageName):production'"
+          
+          # Create a new revision with the latest production image
+          az containerapp update \
+            --name $(containerAppName) \
+            --resource-group $(resourceGroup) \
+            --image "$(containerRegistry)/$(imageName):$(Build.BuildId)" \
+            --output table \
+            --set-env-vars \
+             AZURE_CLIENT_ID=$(AZURE_CLIENT_ID) \
+             AZURE_TENANT_ID=$(AZURE_TENANT_ID) \
+             AZURE_CLIENT_SECRET=$(AZURE_CLIENT_SECRET)
+
+
+    - task: AzureCLI@2
+      displayName: 'Switch Traffic to New Revision (100%)'
+      inputs:
+        azureSubscription: 'ITServices-Galileo'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Get the latest revision name
+          LATEST_REVISION=$(az containerapp revision list \
+            --name $(containerAppName) \
+            --resource-group $(resourceGroup) \
+            --query "reverse(sort_by([].{Name:name, CreatedTime:createdTime}, &CreatedTime))[0].name" \
+            --output tsv)
+          
+          echo "Latest revision: $LATEST_REVISION"
+          
+          # Update traffic to route 100% to the latest revision
+          az containerapp ingress traffic set \
+            --name $(containerAppName) \
+            --resource-group $(resourceGroup) \
+            --revision-weight "$LATEST_REVISION=100"
+          
+          echo "Traffic successfully routed 100% to the latest revision"
+
+    - task: AzureCLI@2
+      displayName: 'Stop Staging Container App'
+      inputs:
+        azureSubscription: 'ITServices-Galileo'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Stop the staging container app
+          echo "Stopping staging container app: $(stagingContainerAppName)"
+          
+          az containerapp stop \
+            --name $(stagingContainerAppName) \
+            --resource-group $(resourceGroup)
+          
+          echo "Staging container app stopped successfully"
