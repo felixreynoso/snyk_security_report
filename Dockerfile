@@ -1,5 +1,5 @@
 # Base stage with common dependencies
-FROM python:3.12.6-slim-bookworm AS base
+FROM python:3.13.5-slim-bookworm AS base
 WORKDIR /app
 
 # Install the Azure CLI
